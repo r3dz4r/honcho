@@ -308,3 +308,123 @@ async def test_stale_cleanup_gate_zero_interval_runs_every_poll(
     await qm._maybe_cleanup_stale_work_units()  # pyright: ignore[reportPrivateUsage]
     await qm._maybe_cleanup_stale_work_units()  # pyright: ignore[reportPrivateUsage]
     assert runs["n"] == 2
+# --- embedding validator startup retry ---------------------------------------
+#
+# Regression guard for the deriver/DB startup race:
+# When Postgres is unreachable on boot (e.g. Docker container not up yet),
+# validate_embedding_schema must retry with backoff rather than raising
+# StartupValidationError immediately. Observed failing in production on
+# 2026-07-28 — deriver exited with code 3 because honcho-db was still starting.
+
+
+import asyncio
+from unittest.mock import patch
+
+import pytest
+
+from src.startup.embedding_validator import (
+    StartupValidationError,
+    validate_embedding_schema,
+)
+
+
+class _FakeScalarResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeConnection:
+    """Async context manager that returns rows like a real SQLAlchemy conn."""
+
+    def __init__(self, typmod: int = 1536) -> None:
+        self._typmod = typmod
+
+    async def __aenter__(self) -> "_FakeConnection":
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def execute(self, _stmt, _params=None):
+        # Return iterable rows with .table_name and .typmod attributes
+        # (validator does: {row.table_name: row.typmod for row in result})
+        return iter([SimpleNamespace(table_name="documents", typmod=self._typmod),
+                     SimpleNamespace(table_name="message_embeddings", typmod=self._typmod)])
+
+
+class _FakeEngine:
+    """Stand-in for sqlalchemy AsyncEngine that fails N times then succeeds.
+
+    Real AsyncEngine.connect() returns an async context manager, NOT a
+    coroutine. Our fake mimics that — validator uses `async with engine.connect()`.
+    """
+
+    def __init__(self, fail_count: int, fail_exception: Exception,
+                 success_typmod: int = 1536) -> None:
+        self.fail_count = fail_count
+        self.fail_exception = fail_exception
+        self.success_typmod = success_typmod
+        self.attempts = 0
+
+    def connect(self):
+        """Return an awaitable that yields an async context manager.
+
+        Real AsyncEngine.connect() returns the context manager directly
+        (the `async with` calls __aenter__). To simulate connection failure
+        on attempt N, we need __aenter__ to raise.
+        """
+        self.attempts += 1
+        if self.attempts <= self.fail_count:
+            return _FailingConnect(self.fail_exception)
+        return _FakeConnection(typmod=self.success_typmod)
+
+
+class _FailingConnect:
+    """Async context manager that raises the given exception on __aenter__."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *exc):
+        return None
+
+
+def test_embedding_validator_succeeds_after_transient_connection_refused():
+    """Regression guard for the deriver/DB startup race (2026-07-28).
+
+    If Postgres refuses connections for the first few attempts (e.g. honcho-db
+    Docker container still starting), validate_embedding_schema must retry
+    with backoff and eventually succeed. Without this, the deriver exits at
+    boot and Restart=on-failure has to bring it back later.
+    """
+    engine = _FakeEngine(
+        # Fail the first 2 attempts, succeed on the 3rd. The validator's
+        # retry budget is 3 attempts total (see _RETRY_ATTEMPTS), so this
+        # leaves exactly enough headroom for the recovery path to fire
+        # without exceeding the budget.
+        fail_count=2,
+        fail_exception=ConnectionRefusedError(
+            "connection to server at '127.0.0.1', port 5432 failed: "
+            "Connection refused"
+        ),
+    )
+    asyncio.run(validate_embedding_schema(engine))
+
+
+def test_embedding_validator_raises_after_retry_budget_exhausted():
+    """If Postgres stays unreachable past the retry budget, the validator
+    must raise StartupValidationError (fail-closed — better to crash the
+    deriver than serve traffic with unknown embedding schema).
+    """
+    engine = _FakeEngine(
+        fail_count=999,
+        fail_exception=ConnectionRefusedError("always down"),
+    )
+    with pytest.raises(StartupValidationError):
+        asyncio.run(validate_embedding_schema(engine))

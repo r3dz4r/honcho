@@ -93,7 +93,15 @@ async def _introspect_pgvector_dims_with_retry(
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(_RETRY_ATTEMPTS),
             wait=wait_fixed(_RETRY_BACKOFF_SECONDS),
-            retry=retry_if_exception_type(SQLAlchemyError),
+            # Retry on SQLAlchemy errors AND raw OS-level connection failures
+            # (e.g. ConnectionRefusedError when Postgres is still starting up
+            # and the kernel-level connect() fails before psycopg/SQLAlchemy
+            # can wrap it). Without OSError here, a Docker container that
+            # hasn't finished booting causes an immediate crash instead of
+            # the bounded retry this validator is supposed to provide.
+            # Regression: 2026-07-28 — deriver exited with code 3 because
+            # honcho-db was still starting.
+            retry=retry_if_exception_type((SQLAlchemyError, OSError)),
             before_sleep=before_sleep_log(logger, logging.WARNING),
             reraise=False,
         ):
