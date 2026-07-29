@@ -1,11 +1,20 @@
 import json
 import logging
 import re
-from typing import Any
+from typing import TypedDict
 
 from json_repair import repair_json
 
 logger = logging.getLogger(__name__)
+
+
+class JsonToken(TypedDict):
+    type: str
+    value: str
+    start: int
+    end: int
+
+
 # logging.getLogger("sqlalchemy.engine.Engine").disabled = True
 
 
@@ -132,13 +141,13 @@ def try_contextual_closure_repair(json_str: str) -> str | None:
     """Smart closure repair based on JSON context"""
     try:
         # Find the last valid JSON token
-        tokens: list[dict[str, Any]] = tokenize_json(json_str)
+        tokens: list[JsonToken] = tokenize_json(json_str)
 
         # Look for patterns that indicate what should come next
         if not tokens:
             return None
 
-        last_token: dict[str, Any] = tokens[-1]
+        last_token: JsonToken = tokens[-1]
 
         # If last token is a value, we might need to close objects/arrays
         if last_token["type"] in ["string", "number", "boolean", "null"]:
@@ -153,90 +162,112 @@ def try_contextual_closure_repair(json_str: str) -> str | None:
         return None
 
 
-def tokenize_json(json_str: str) -> list[dict[str, Any]]:
+def _scan_string_token(json_str: str, i: int) -> tuple[JsonToken, int]:
+    """Scan a JSON string literal starting at index i. Returns token and next index."""
+    start = i
+    i += 1
+    while i < len(json_str):
+        if json_str[i] == '"' and json_str[i - 1] != "\\":
+            break
+        i += 1
+    token: JsonToken = {
+        "type": "string",
+        "value": json_str[start : i + 1],
+        "start": start,
+        "end": i,
+    }
+    return token, i
+
+
+def _scan_number_token(json_str: str, i: int) -> tuple[JsonToken, int]:
+    """Scan a JSON number starting at index i. Returns token and next index."""
+    start = i
+    i += 1
+    while i < len(json_str) and (json_str[i].isdigit() or json_str[i] in ".-eE"):
+        i += 1
+    token: JsonToken = {
+        "type": "number",
+        "value": json_str[start:i],
+        "start": start,
+        "end": i - 1,
+    }
+    return token, i
+
+
+_STRUCTURAL_TYPES: dict[str, str] = {
+    "{": "object_start",
+    "}": "object_end",
+    "[": "array_start",
+    "]": "array_end",
+    ",": "comma",
+    ":": "colon",
+}
+
+
+def _scan_structural_token(json_str: str, i: int) -> JsonToken:
+    """Build a token for a structural character ({}[],:) at index i."""
+    char = json_str[i]
+    token: JsonToken = {
+        "type": _STRUCTURAL_TYPES[char],
+        "value": char,
+        "start": i,
+        "end": i,
+    }
+    return token
+
+
+_LITERAL_TYPES: dict[str, tuple[str, int]] = {
+    "true": ("boolean", 4),
+    "false": ("boolean", 5),
+    "null": ("null", 4),
+}
+
+
+def _scan_literal_token(json_str: str, i: int) -> tuple[JsonToken | None, int]:
+    """Try to match true/false/null at index i. Returns token or None, plus next index."""
+    for literal, (type_name, length) in _LITERAL_TYPES.items():
+        if json_str[i : i + length] == literal:
+            token: JsonToken = {
+                "type": type_name,
+                "value": literal,
+                "start": i,
+                "end": i + length - 1,
+            }
+            return token, i + length - 1
+    return None, i
+
+
+def tokenize_json(json_str: str) -> list[JsonToken]:
     """Tokenize JSON string into meaningful components"""
-    tokens: list[dict[str, Any]] = []
+    tokens: list[JsonToken] = []
     i = 0
 
     while i < len(json_str):
         char = json_str[i]
 
-        # Skip whitespace
         if char.isspace():
             i += 1
             continue
 
-        # String literals
         if char == '"':
-            start = i
-            i += 1
-            while i < len(json_str):
-                if json_str[i] == '"' and json_str[i - 1] != "\\":
-                    break
-                i += 1
-            tokens.append(
-                {
-                    "type": "string",
-                    "value": json_str[start : i + 1],
-                    "start": start,
-                    "end": i,
-                }
-            )
-
-        # Numbers
+            token, i = _scan_string_token(json_str, i)
+            tokens.append(token)
         elif char.isdigit() or char == "-":
-            start = i
-            while i < len(json_str) and (
-                json_str[i].isdigit() or json_str[i] in ".-eE"
-            ):
-                i += 1
-            tokens.append(
-                {
-                    "type": "number",
-                    "value": json_str[start:i],
-                    "start": start,
-                    "end": i - 1,
-                }
-            )
-            continue  # Don't increment i again
-
-        # Structural characters
+            token, i = _scan_number_token(json_str, i)
+            tokens.append(token)
         elif char in "{}[],:":
-            token_type = {
-                "{": "object_start",
-                "}": "object_end",
-                "[": "array_start",
-                "]": "array_end",
-                ",": "comma",
-                ":": "colon",
-            }[char]
-
-            tokens.append({"type": token_type, "value": char, "start": i, "end": i})
-
-        # Boolean/null literals
+            tokens.append(_scan_structural_token(json_str, i))
         elif char in "tfn":
-            if json_str[i : i + 4] == "true":
-                tokens.append(
-                    {"type": "boolean", "value": "true", "start": i, "end": i + 3}
-                )
-                i += 3
-            elif json_str[i : i + 5] == "false":
-                tokens.append(
-                    {"type": "boolean", "value": "false", "start": i, "end": i + 4}
-                )
-                i += 4
-            elif json_str[i : i + 4] == "null":
-                tokens.append(
-                    {"type": "null", "value": "null", "start": i, "end": i + 3}
-                )
-                i += 3
+            token, i = _scan_literal_token(json_str, i)
+            if token is not None:
+                tokens.append(token)
 
         i += 1
 
     return tokens
 
 
-def try_close_after_value(json_str: str, tokens: list[dict[str, Any]]) -> str | None:
+def try_close_after_value(json_str: str, tokens: list[JsonToken]) -> str | None:
     """Try to close JSON after a value token"""
     # Analyze nesting to determine what needs to be closed
     nesting_stack: list[str] = []
@@ -264,7 +295,7 @@ def try_close_after_value(json_str: str, tokens: list[dict[str, Any]]) -> str | 
         return None
 
 
-def try_complete_structure(json_str: str, tokens: list[dict[str, Any]]) -> str | None:
+def try_complete_structure(json_str: str, tokens: list[JsonToken]) -> str | None:
     """Try to complete JSON ending with structural tokens like comma or colon"""
     last_token = tokens[-1]
 

@@ -916,8 +916,9 @@ async def create_observations(
     """
     Create multiple observations (documents) from user input.
 
-    This function validates all referenced resources, generates embeddings
-    in batch, and creates the documents.
+    This function validates all referenced resources and creates the documents.
+    Embedding is best-effort on this request path; documents are persisted as
+    pending when the provider is unavailable so reconciliation can retry later.
 
     Args:
         db: Database session
@@ -929,7 +930,7 @@ async def create_observations(
 
     Raises:
         ResourceNotFoundException: If any session or peer is not found
-        ValidationException: If embedding generation fails or integrity constraint is violated
+        ValidationException: If an integrity constraint is violated
     """
     if not observations:
         return []
@@ -960,12 +961,20 @@ async def create_observations(
             db, workspace_name, observer=observer, observed=observed
         )
 
-    # Generate embeddings in batch
+    # Generate embeddings in batch. Conclusion creation must not depend on an
+    # external embedding provider: persist rows as pending when configuration or
+    # provider calls fail, and let vector reconciliation retry them later.
     contents = [obs.content for obs in observations]
     try:
-        embeddings = await embedding_client.simple_batch_embed(contents)
-    except ValueError as e:
-        raise ValidationException(str(e)) from e
+        generated_embeddings = await embedding_client.simple_batch_embed(contents)
+        embeddings: list[list[float] | None] = list(generated_embeddings)
+    except Exception:
+        logger.warning(
+            "Embedding unavailable while creating %d observations; persisting them pending reconciliation",
+            len(observations),
+            exc_info=True,
+        )
+        embeddings = [None] * len(observations)
 
     # Create document objects and track embeddings for vector store
     honcho_documents: list[models.Document] = []
@@ -981,7 +990,7 @@ async def create_observations(
     )
 
     for obs, embedding in zip(observations, embeddings, strict=True):
-        if store_embeddings_in_postgres:
+        if store_embeddings_in_postgres and embedding is not None:
             doc = models.Document(
                 workspace_name=workspace_name,
                 observer=obs.observer_id,
@@ -1008,10 +1017,11 @@ async def create_observations(
         honcho_documents.append(doc)
 
         # Track embedding for vector store (grouped by collection)
-        collection_key = (obs.observer_id, obs.observed_id)
-        if collection_key not in collection_embeddings:
-            collection_embeddings[collection_key] = []
-        collection_embeddings[collection_key].append((doc, embedding))
+        if embedding is not None:
+            collection_key = (obs.observer_id, obs.observed_id)
+            if collection_key not in collection_embeddings:
+                collection_embeddings[collection_key] = []
+            collection_embeddings[collection_key].append((doc, embedding))
 
     try:
         db.add_all(honcho_documents)
@@ -1022,13 +1032,17 @@ async def create_observations(
 
         # Store embeddings in external vector store after documents are committed (IDs now available)
         external_vector_store = get_external_vector_store()
-        all_doc_ids = [doc.id for doc in honcho_documents]
+        embedded_doc_ids = [
+            doc.id
+            for doc, embedding in zip(honcho_documents, embeddings, strict=True)
+            if embedding is not None
+        ]
 
         # If no external vector store (pgvector mode), mark as synced immediately
-        if external_vector_store is None:
+        if external_vector_store is None and embedded_doc_ids:
             await db.execute(
                 update(models.Document)
-                .where(models.Document.id.in_(all_doc_ids))
+                .where(models.Document.id.in_(embedded_doc_ids))
                 .values(
                     sync_state="synced",
                     last_sync_at=func.now(),
@@ -1036,7 +1050,7 @@ async def create_observations(
                 )
             )
             await db.commit()
-        else:
+        elif external_vector_store is not None:
             # External vector store - upsert each collection's embeddings
             for (
                 observer,

@@ -265,7 +265,7 @@ def build_message_vector_record(
 async def _sync_documents(
     db: AsyncSession,
     documents: list[models.Document],
-    external_vector_store: VectorStore,
+    external_vector_store: VectorStore | None,
 ) -> tuple[int, int]:
     """
     Sync a batch of pending documents to the external vector store.
@@ -324,6 +324,22 @@ async def _sync_documents(
     if failed_to_embed:
         await _bump_document_sync_attempts(db, failed_to_embed)
         failed_count += len(failed_to_embed)
+
+    # In pgvector-only mode, freshly generated embeddings are already attached
+    # to the ORM rows. Mark those documents synced; the transaction caller
+    # persists both the vector and state together.
+    if external_vector_store is None:
+        docs_to_sync = [doc for doc in documents if doc.id in freshly_embedded]
+        if docs_to_sync:
+            await db.execute(
+                update(models.Document)
+                .where(models.Document.id.in_([doc.id for doc in docs_to_sync]))
+                .values(
+                    sync_state="synced", last_sync_at=func.now(), sync_attempts=0
+                )
+            )
+            synced_count += len(docs_to_sync)
+        return synced_count, failed_count
 
     # Step 2: Build vector records and upsert to external store (all cases)
     by_namespace: dict[str, list[models.Document]] = {}
@@ -606,7 +622,7 @@ async def _cleanup_soft_deleted_documents_pgvector(
 
 
 async def _reconcile_documents_batch(
-    external_vector_store: VectorStore,
+    external_vector_store: VectorStore | None,
     metrics: ReconciliationMetrics,
 ) -> bool:
     """
@@ -715,10 +731,15 @@ async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
     external_vector_store = get_external_vector_store()
     deadline = time.monotonic() + RECONCILIATION_TIME_BUDGET_SECONDS
 
-    # pgvector-only mode: still need to embed pending MessageEmbedding rows
-    # (create_messages defers embedding to the reconciler), then clean up.
+    # pgvector-only mode: embed pending documents and MessageEmbedding rows,
+    # then clean up.
     if external_vector_store is None:
         while time.monotonic() < deadline:
+            docs_work = await _reconcile_documents_batch(None, metrics)
+
+            if time.monotonic() >= deadline:
+                break
+
             embs_work = await _reconcile_message_embeddings_batch(None, metrics)
 
             if time.monotonic() >= deadline:
@@ -726,7 +747,7 @@ async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
 
             cleanup_work = await _cleanup_pgvector_batch(metrics)
 
-            if not (embs_work or cleanup_work):
+            if not (docs_work or embs_work or cleanup_work):
                 break
         logger.debug("Vector reconciliation cycle completed (pgvector mode)")
         return metrics
