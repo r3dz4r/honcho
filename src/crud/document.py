@@ -476,6 +476,90 @@ class CreateDocumentsResult:
     semantic_dup_replaced_count: int = 0
 
 
+@dataclass
+class ExactDeduplicationResult:
+    documents: list[schemas.DocumentCreate] = field(default_factory=list)
+    exact_dup_in_batch_count: int = 0
+    exact_dup_existing_count: int = 0
+
+
+async def _deduplicate_documents(
+    db: AsyncSession,
+    documents: Sequence[schemas.DocumentCreate],
+    workspace_name: str,
+    *,
+    observer: str,
+    observed: str,
+    require_explicit_session: bool = True,
+) -> ExactDeduplicationResult:
+    """Remove exact duplicates and reinforce matching existing documents."""
+    batch_normalized = {_normalize_content(document.content) for document in documents}
+    existing_by_key: dict[tuple[str, str, str | None], models.Document] = {}
+    if batch_normalized:
+        normalized_content_sql = func.lower(
+            func.regexp_replace(models.Document.content, r"^\s+|\s+$", "", "g")
+        )
+        existing_result = await db.execute(
+            select(models.Document).where(
+                models.Document.workspace_name == workspace_name,
+                models.Document.observer == observer,
+                models.Document.observed == observed,
+                models.Document.deleted_at.is_(None),
+                normalized_content_sql.in_(batch_normalized),
+            )
+        )
+        for existing_doc in existing_result.scalars():
+            existing_by_key.setdefault(
+                _dedup_key(
+                    existing_doc.content,
+                    existing_doc.level,
+                    existing_doc.session_name,
+                ),
+                existing_doc,
+            )
+
+    result = ExactDeduplicationResult()
+    seen_in_batch: set[tuple[str, str, str | None]] = set()
+    for document in documents:
+        if (
+            require_explicit_session
+            and document.level == "explicit"
+            and document.session_name is None
+        ):
+            logger.error(
+                "Refusing to create explicit document without session_name in %s/%s/%s (session-purity invariant): %r",
+                workspace_name,
+                observer,
+                observed,
+                document.content[:80],
+            )
+            continue
+
+        dedup_key = _dedup_key(
+            document.content,
+            document.level,
+            document.session_name,
+        )
+        if dedup_key in seen_in_batch:
+            result.exact_dup_in_batch_count += 1
+            continue
+        seen_in_batch.add(dedup_key)
+
+        existing_match = existing_by_key.get(dedup_key)
+        if existing_match is not None:
+            existing_match.times_derived = func.greatest(
+                models.Document.times_derived + 1,
+                document.times_derived,
+            )
+            await db.flush()
+            result.exact_dup_existing_count += 1
+            continue
+
+        result.documents.append(document)
+
+    return result
+
+
 async def create_documents(
     db: AsyncSession,
     documents: list[schemas.DocumentCreate],
@@ -509,103 +593,18 @@ async def create_documents(
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
 
-    # exact-content dedup (independent of `deduplicate`): pre-fetch
-    # existing live documents whose normalized content matches anything in this
-    # batch, scoped to (workspace, observer, observed). The SQL normalization must
-    # mirror _normalize_content. Matching is further scoped per-document by
-    # level (always) and session (for explicit documents) via _dedup_key.
-    batch_normalized: set[str] = {_normalize_content(d.content) for d in documents}
-    existing_by_key: dict[tuple[str, str, str | None], models.Document] = {}
-    if batch_normalized:
-        # The `normalized_content_sql.in_(...)` filter below narrows to the
-        # (workspace, observer, observed) partition via the single-column indexes,
-        # then evaluates lower(regexp_replace(...)) per row.
-        # TODO: add a partial expression index matching
-        # this filter exactly
-        #     CREATE INDEX ix_documents_normalized_content
-        #     ON documents (
-        #         workspace_name,
-        #         observer,
-        #         observed,
-        #         (lower(regexp_replace(content, '^\s+|\s+$', '', 'g')))
-        #     )
-        #     WHERE deleted_at IS NULL;
-        normalized_content_sql = func.lower(
-            func.regexp_replace(models.Document.content, r"^\s+|\s+$", "", "g")
-        )
-        existing_result = await db.execute(
-            select(models.Document).where(
-                models.Document.workspace_name == workspace_name,
-                models.Document.observer == observer,
-                models.Document.observed == observed,
-                models.Document.deleted_at.is_(None),
-                normalized_content_sql.in_(batch_normalized),
-            )
-        )
-        for existing_doc in existing_result.scalars():
-            # If multiple historical rows share a dedup key, reinforcing
-            # one is sufficient; keep the first.
-            existing_by_key.setdefault(
-                _dedup_key(
-                    existing_doc.content,
-                    existing_doc.level,
-                    existing_doc.session_name,
-                ),
-                existing_doc,
-            )
+    exact_deduplication = await _deduplicate_documents(
+        db,
+        documents,
+        workspace_name,
+        observer=observer,
+        observed=observed,
+    )
 
-    # Tracks dedup keys already accepted from this batch so exact
-    # duplicates within a single inference call collapse to one document.
-    seen_in_batch: set[tuple[str, str, str | None]] = set()
-
-    exact_dup_existing_count = 0
-    exact_dup_in_batch_count = 0
     semantic_dup_rejected_count = 0
     semantic_dup_replaced_count = 0
-    for doc in documents:
+    for doc in exact_deduplication.documents:
         try:
-            # Session-purity invariant: an explicit document must always carry
-            # the session it was derived from. Refuse to write session-less
-            # explicit documents rather than silently minting global explicit
-            # memory (the Scopes copy-by-session model depends on explicit
-            # documents staying session-pure).
-            if doc.level == "explicit" and doc.session_name is None:
-                logger.error(
-                    "Refusing to create explicit document without session_name in %s/%s/%s (session-purity invariant): %r",
-                    workspace_name,
-                    observer,
-                    observed,
-                    doc.content[:80],
-                )
-                continue
-
-            dedup_key = _dedup_key(doc.content, doc.level, doc.session_name)
-
-            # Exact-match dedup, always on:
-            # 1) collapse exact duplicates within this batch (drop silently).
-            if dedup_key in seen_in_batch:
-                exact_dup_in_batch_count += 1
-                continue
-            seen_in_batch.add(dedup_key)
-
-            # 2) drop exact duplicates of an existing live document, recording
-            #    the re-derivation as reinforcement on the existing row.
-            existing_match = existing_by_key.get(dedup_key)
-            if existing_match is not None:
-                # Reinforce the existing row. greatest(...) keeps the bump atomic
-                # server-side (concurrent workers can't lose an increment) while
-                # still honoring an incoming doc that already carries accumulated
-                # reinforcement (times_derived > 1, e.g. a future re-ingestion or
-                # collection-merge path). Mirrors the superior-replacement branch
-                # in is_rejected_duplicate.
-                existing_match.times_derived = func.greatest(
-                    models.Document.times_derived + 1,
-                    doc.times_derived,
-                )
-                await db.flush()
-                exact_dup_existing_count += 1
-                continue
-
             # for each document, if deduplicate is True, perform a process
             # that checks against existing documents and either rejects this document
             # as a duplicate OR deletes an existing document that is a duplicate.
@@ -772,8 +771,8 @@ async def create_documents(
 
     return CreateDocumentsResult(
         created_documents=accepted_documents,
-        exact_dup_existing_count=exact_dup_existing_count,
-        exact_dup_in_batch_count=exact_dup_in_batch_count,
+        exact_dup_existing_count=exact_deduplication.exact_dup_existing_count,
+        exact_dup_in_batch_count=exact_deduplication.exact_dup_in_batch_count,
         semantic_dup_rejected_count=semantic_dup_rejected_count,
         semantic_dup_replaced_count=semantic_dup_replaced_count,
     )
@@ -961,20 +960,62 @@ async def create_observations(
             db, workspace_name, observer=observer, observed=observed
         )
 
+    documents_by_collection: dict[
+        tuple[str, str], list[tuple[int, schemas.DocumentCreate]]
+    ] = {}
+    for index, observation in enumerate(observations):
+        collection_key = (observation.observer_id, observation.observed_id)
+        document = schemas.DocumentCreate(
+            content=observation.content,
+            level="explicit",
+            times_derived=1,
+            metadata=schemas.DocumentMetadata(
+                message_ids=[],
+                message_created_at="",
+            ),
+            session_name=observation.session_id,
+            embedding=[],
+        )
+        documents_by_collection.setdefault(collection_key, []).append((index, document))
+
+    deduplicated_documents: list[
+        tuple[int, tuple[str, str], schemas.DocumentCreate]
+    ] = []
+    for (observer, observed), indexed_documents in documents_by_collection.items():
+        exact_deduplication = await _deduplicate_documents(
+            db,
+            [document for _, document in indexed_documents],
+            workspace_name,
+            observer=observer,
+            observed=observed,
+            require_explicit_session=False,
+        )
+        accepted_ids = {id(document) for document in exact_deduplication.documents}
+        deduplicated_documents.extend(
+            (index, (observer, observed), document)
+            for index, document in indexed_documents
+            if id(document) in accepted_ids
+        )
+    deduplicated_documents.sort(key=lambda item: item[0])
+
     # Generate embeddings in batch. Conclusion creation must not depend on an
     # external embedding provider: persist rows as pending when configuration or
     # provider calls fail, and let vector reconciliation retry them later.
-    contents = [obs.content for obs in observations]
-    try:
-        generated_embeddings = await embedding_client.simple_batch_embed(contents)
-        embeddings: list[list[float] | None] = list(generated_embeddings)
-    except Exception:
-        logger.warning(
-            "Embedding unavailable while creating %d observations; persisting them pending reconciliation",
-            len(observations),
-            exc_info=True,
-        )
-        embeddings = [None] * len(observations)
+    contents = [document.content for _, _, document in deduplicated_documents]
+    embeddings: list[list[float] | None]
+    if contents:
+        try:
+            generated_embeddings = await embedding_client.simple_batch_embed(contents)
+            embeddings = list(generated_embeddings)
+        except Exception:
+            logger.warning(
+                "Embedding unavailable while creating %d observations; persisting them pending reconciliation",
+                len(deduplicated_documents),
+                exc_info=True,
+            )
+            embeddings = [None] * len(deduplicated_documents)
+    else:
+        embeddings = []
 
     # Create document objects and track embeddings for vector store
     honcho_documents: list[models.Document] = []
@@ -989,36 +1030,38 @@ async def create_observations(
         settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
     )
 
-    for obs, embedding in zip(observations, embeddings, strict=True):
+    for (_, (observer, observed), document), embedding in zip(
+        deduplicated_documents, embeddings, strict=True
+    ):
         if store_embeddings_in_postgres and embedding is not None:
             doc = models.Document(
                 workspace_name=workspace_name,
-                observer=obs.observer_id,
-                observed=obs.observed_id,
-                content=obs.content,
-                level="explicit",  # Manually created observations are always explicit
-                times_derived=1,
-                internal_metadata={},  # No message_ids since not derived from messages
-                session_name=obs.session_id,
+                observer=observer,
+                observed=observed,
+                content=document.content,
+                level=document.level,
+                times_derived=document.times_derived,
+                internal_metadata={},  # No message IDs: manually created observation
+                session_name=document.session_name,
                 embedding=embedding,
             )
         else:
             doc = models.Document(
                 workspace_name=workspace_name,
-                observer=obs.observer_id,
-                observed=obs.observed_id,
-                content=obs.content,
-                level="explicit",  # Manually created observations are always explicit
-                times_derived=1,
-                internal_metadata={},  # No message_ids since not derived from messages
-                session_name=obs.session_id,
+                observer=observer,
+                observed=observed,
+                content=document.content,
+                level=document.level,
+                times_derived=document.times_derived,
+                internal_metadata={},  # No message IDs: manually created observation
+                session_name=document.session_name,
             )
         doc.sync_state = "pending"
         honcho_documents.append(doc)
 
         # Track embedding for vector store (grouped by collection)
         if embedding is not None:
-            collection_key = (obs.observer_id, obs.observed_id)
+            collection_key = (observer, observed)
             if collection_key not in collection_embeddings:
                 collection_embeddings[collection_key] = []
             collection_embeddings[collection_key].append((doc, embedding))

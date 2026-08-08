@@ -84,7 +84,7 @@ async def list_conclusions(
         reverse=reverse or False,
     )
 
-    return await apaginate(db, stmt)
+    return await apaginate(db, stmt.distinct())
 
 
 @router.post(
