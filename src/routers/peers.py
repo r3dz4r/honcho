@@ -8,7 +8,7 @@ from time import perf_counter
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Response
 from fastapi.responses import StreamingResponse
-from fastapi_pagination import Page
+from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,6 +51,7 @@ async def get_peers(
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all Peers for a Workspace, paginated with optional filters."""
     filter_param = None
@@ -66,6 +67,7 @@ async def get_peers(
             filters=filter_param,
             reverse=reverse,
         ),
+        params=params,
     )
 
 
@@ -142,6 +144,7 @@ async def get_sessions_for_peer(
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all Sessions for a Peer, paginated with optional filters."""
     filter_param = None
@@ -159,6 +162,7 @@ async def get_sessions_for_peer(
             filters=filter_param,
             reverse=reverse,
         ),
+        params=params,
     )
 
 
