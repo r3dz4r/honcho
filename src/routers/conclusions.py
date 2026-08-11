@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Body, Depends, Path, Query
-from fastapi_pagination import Page
+from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +68,7 @@ async def list_conclusions(
         description="Whether to reverse the order of results",
     ),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """
     List Conclusions using optional filters, ordered by recency unless `reverse` is true. Results are paginated.
@@ -84,7 +85,7 @@ async def list_conclusions(
         reverse=reverse or False,
     )
 
-    return await apaginate(db, stmt.distinct())
+    return await apaginate(db, stmt.distinct(), params=params)
 
 
 @router.post(

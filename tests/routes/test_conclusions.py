@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from nanoid import generate as generate_nanoid
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
@@ -287,8 +288,8 @@ class TestConclusionRoutes:
             db_session, test_workspace.name, test_peer.name, test_peer2.name
         )
 
-        # Create multiple conclusions
-        for i in range(15):
+        # Create enough conclusions to exercise multiple pages.
+        for i in range(120):
             doc = models.Document(
                 workspace_name=test_workspace.name,
                 observer=test_peer.name,
@@ -300,7 +301,28 @@ class TestConclusionRoutes:
             db_session.add(doc)
         await db_session.commit()
 
-        # Get first page (default size)
+        # Get all pages and verify their IDs do not overlap.
+        page_ids = []
+        for page in range(1, 4):
+            response = client.post(
+                f"/v3/workspaces/{test_workspace.name}/conclusions/list?page={page}&size=50",
+                json={"filters": {"session_id": test_session.name}},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            page_ids.extend(item["id"] for item in data["items"])
+            assert data["total"] == 120
+
+        document_count = await db_session.scalar(
+            select(func.count()).select_from(models.Document).where(
+                models.Document.workspace_name == test_workspace.name
+            )
+        )
+        assert len(page_ids) == document_count
+        assert len(set(page_ids)) == document_count
+
+        # The original, smaller page-size case remains covered as well.
         response = client.post(
             f"/v3/workspaces/{test_workspace.name}/conclusions/list?page=1&size=10",
             json={"filters": {"session_id": test_session.name}},
@@ -309,7 +331,7 @@ class TestConclusionRoutes:
         assert response.status_code == 200
         data = response.json()
         assert len(data["items"]) == 10
-        assert data["total"] == 15
+        assert data["total"] == 120
 
         # Get second page
         response = client.post(
@@ -319,8 +341,8 @@ class TestConclusionRoutes:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data["items"]) == 5
-        assert data["total"] == 15
+        assert len(data["items"]) == 10
+        assert data["total"] == 120
 
     @pytest.mark.asyncio
     async def test_query_conclusions_success(
