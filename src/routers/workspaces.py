@@ -3,7 +3,7 @@
 import logging
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Response
-from fastapi_pagination import Page
+from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +68,7 @@ async def get_all_workspaces(
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all Workspaces, paginated with optional filters."""
     filter_param = None
@@ -79,6 +80,7 @@ async def get_all_workspaces(
     return await apaginate(
         db,
         await crud.get_all_workspaces(filters=filter_param, reverse=reverse),
+        params=params,
     )
 
 
