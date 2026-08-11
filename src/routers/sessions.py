@@ -5,7 +5,7 @@ from contextlib import suppress
 from time import perf_counter
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Response
-from fastapi_pagination import Page
+from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -252,6 +252,7 @@ async def get_sessions(
     ),
     reverse: bool = Query(False, description="Whether to reverse the order of results"),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all Sessions for a Workspace, paginated with optional filters."""
     filter_param = None
@@ -268,6 +269,7 @@ async def get_sessions(
             filters=filter_param,
             reverse=reverse,
         ),
+        params=params,
     )
 
 
@@ -617,13 +619,14 @@ async def get_session_peers(
     workspace_id: str = Path(...),
     session_id: str = Path(...),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all Peers in a Session. Results are paginated."""
     try:
         peers_query = await crud.get_peers_from_session(
             workspace_name=workspace_id, session_name=session_id
         )
-        return await apaginate(db, peers_query)
+        return await apaginate(db, peers_query, params=params)
     except ValueError as e:
         logger.warning(f"Failed to get peers from session {session_id}: {str(e)}")
         raise ResourceNotFoundException("Session not found") from e
