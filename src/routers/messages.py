@@ -11,7 +11,7 @@ from fastapi import (
     Query,
     UploadFile,
 )
-from fastapi_pagination import Page
+from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -317,6 +317,7 @@ async def get_messages(
         False, description="Whether to reverse the order of results"
     ),
     db: AsyncSession = read_db,
+    params: Params = Depends(),
 ):
     """Get all messages for a Session with optional filters. Results are paginated."""
     try:
@@ -333,7 +334,7 @@ async def get_messages(
             reverse=reverse,
         )
 
-        return await apaginate(db, messages_query)
+        return await apaginate(db, messages_query, params=params)
     except ValueError as e:
         logger.warning(f"Failed to get messages for session {session_id}: {str(e)}")
         raise ResourceNotFoundException("Session not found") from e
