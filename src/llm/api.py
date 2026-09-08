@@ -17,13 +17,14 @@ from typing import Any, Literal, TypeVar, cast, overload
 
 from pydantic import BaseModel
 from sentry_sdk.ai.monitoring import ai_track
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import ConfiguredModelSettings, ModelConfig
 from src.exceptions import ValidationException
 from src.telemetry.reasoning_traces import log_reasoning_trace
 
 from .executor import honcho_llm_call_inner
+from .retry import is_retryable_llm_error
 from .runtime import (
     AttemptPlan,
     current_attempt,
@@ -278,6 +279,7 @@ async def honcho_llm_call(
 
     if enable_retry:
         decorated = retry(
+            retry=retry_if_exception(is_retryable_llm_error),
             stop=stop_after_attempt(retry_attempts),
             wait=wait_exponential(multiplier=1, min=4, max=10),
             before_sleep=before_retry_callback,
@@ -391,6 +393,7 @@ async def honcho_llm_call(
                 wrapped = ai_track(sentry_track_name)(wrapped)
             if enable_retry:
                 wrapped = retry(
+                    retry=retry_if_exception(is_retryable_llm_error),
                     stop=stop_after_attempt(retry_attempts),
                     wait=wait_exponential(multiplier=1, min=4, max=10),
                     before_sleep=before_retry_callback,
