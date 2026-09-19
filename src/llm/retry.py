@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,9 @@ def is_retryable_llm_error(error: BaseException) -> bool:
     and must surface immediately; other errors retain the established retry
     behavior and fallback semantics.
     """
+    if isinstance(error, asyncio.CancelledError):
+        return False
+
     status_code = _http_status_code(error)
     if status_code in _PERMANENT_BUDGET_STATUS_CODES:
         logger.warning(

@@ -44,6 +44,22 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+
+async def _await_provider_operation(
+    awaitable: Any, *, timeout_seconds: float | None = None
+) -> Any:
+    """Apply the Python-3.10-compatible deadline to a provider operation."""
+    timeout = (
+        settings.LLM.REQUEST_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("LLM provider operation exceeded timeout of %s seconds", timeout)
+        raise
+
 M = TypeVar("M", bound=BaseModel)
 
 
@@ -502,16 +518,18 @@ async def honcho_llm_call_inner(
         # Token counts are 0 on this path; aggregate envelopes carry totals.
         stream_start = time.perf_counter()
         try:
-            stream_iter = await execute_stream(
-                backend,
-                effective_config,
-                messages=messages,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_model,
-                cache_policy=effective_config.cache_policy,
-                extra_params=call_extras,
+            stream_iter = await _await_provider_operation(
+                execute_stream(
+                    backend,
+                    effective_config,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_model,
+                    cache_policy=effective_config.cache_policy,
+                    extra_params=call_extras,
+                )
             )
         except BaseException as exc:
             _emit_llm_call_completed(
@@ -530,9 +548,21 @@ async def honcho_llm_call_inner(
             raise
 
         async def _wrap_stream() -> AsyncIterator[HonchoLLMCallStreamChunk]:
+            # Total-stream policy: setup and all chunk draining share one
+            # deadline, so a stream which stops yielding cannot stall forever.
+            deadline = stream_start + settings.LLM.REQUEST_TIMEOUT_SECONDS
             stream_error: BaseException | None = None
             try:
-                async for chunk in stream_iter:
+                while True:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise TimeoutError("LLM stream exceeded configured timeout")
+                    try:
+                        chunk = await _await_provider_operation(
+                            anext(stream_iter), timeout_seconds=remaining
+                        )
+                    except StopAsyncIteration:
+                        break
                     yield stream_chunk_to_response_chunk(chunk)
             except BaseException as exc:
                 stream_error = exc
@@ -558,16 +588,18 @@ async def honcho_llm_call_inner(
     backend_result: BackendCompletionResult | None = None
     error: BaseException | None = None
     try:
-        backend_result = await execute_completion(
-            backend,
-            effective_config,
-            messages=messages,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=tool_choice,
-            response_format=response_model,
-            cache_policy=effective_config.cache_policy,
-            extra_params=call_extras,
+        backend_result = await _await_provider_operation(
+            execute_completion(
+                backend,
+                effective_config,
+                messages=messages,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_model,
+                cache_policy=effective_config.cache_policy,
+                extra_params=call_extras,
+            )
         )
         response = completion_result_to_response(backend_result)
         # Explicit generation output + token usage (replaces @observe

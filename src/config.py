@@ -718,6 +718,12 @@ class LLMSettings(HonchoSettings):
 
     # General LLM settings
     DEFAULT_MAX_TOKENS: Annotated[int, Field(default=1000, gt=0, le=100_000)] = 2500
+    # Bound each provider attempt so a stalled upstream cannot indefinitely
+    # occupy an API request or a deriver worker. Retries retain their own
+    # per-attempt deadline.
+    REQUEST_TIMEOUT_SECONDS: Annotated[
+        float, Field(default=120.0, gt=0.0, le=3600.0)
+    ] = 120.0
 
     # Maximum characters for tool output to prevent token explosion.
     # Set to 10,000 chars (~2,500 tokens at 4 chars/token) to stay well under
@@ -796,6 +802,12 @@ class DeriverSettings(HonchoSettings):
     ENABLED: bool = True
 
     WORKERS: Annotated[int, Field(default=1, gt=0, le=100)] = 1
+    # Bound all work under one queue lease, including provider retry backoff.
+    # Timeouts use the queue's explicit-error path and require an explicit
+    # operator reopen rather than immediate automatic reclamation.
+    WORK_UNIT_TIMEOUT_SECONDS: Annotated[
+        float, Field(default=150.0, gt=0.0, le=3600.0)
+    ] = 150.0
     POLLING_SLEEP_INTERVAL_SECONDS: Annotated[
         float, Field(default=1.0, gt=0.0, le=60.0)
     ] = 1.0

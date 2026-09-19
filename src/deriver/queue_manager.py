@@ -579,19 +579,24 @@ class QueueManager:
         items: list[QueueItem],
         work_unit_key: str,
         context: str,
-    ) -> None:
+    ) -> bool:
         """
-        Handle processing errors by marking queue items as errored, logging, and forwarding to Sentry.
-        We only mark the first queue item as errored so we don't potentially throw away a batch. This allows us
-        to incrementally attempt to process the batch while still maintaining progress in a work unit.
+        Handle processing errors, log them, and forward them to Sentry.
+        Failures use the queue's explicit-error path: the item is consumed with
+        its error recorded, rather than being silently successful or reclaimed
+        immediately. Retrying requires an explicit operator reopen.
 
         Args:
             error: The exception that occurred
             items: The queue items that were being processed
             work_unit_key: The work unit key for the queue items
             context: Context string describing what was being processed (e.g., "processing representation batch")
+
+        Returns:
+            True when the caller must release the current work-unit lease.
         """
         error_msg = f"{error.__class__.__name__}: {str(error)}"
+        should_release_work_unit = isinstance(error, TimeoutError)
         try:
             if items:
                 await self.mark_queue_item_as_errored(
@@ -609,11 +614,23 @@ class QueueManager:
         )
         if settings.SENTRY.ENABLED:
             sentry_sdk.capture_exception(error)
+        return should_release_work_unit
+
+    @staticmethod
+    def _remaining_work_unit_timeout(deadline: float) -> float:
+        """Return remaining lease budget or raise before another operation starts."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("work unit exceeded configured timeout")
+        return remaining
 
     async def process_work_unit(self, work_unit_key: str, worker_id: str) -> None:
         """Process all queue items for a specific work unit by routing to the correct handler."""
         logger.debug(f"Starting to process work unit {work_unit_key}")
         work_unit = parse_work_unit_key(work_unit_key)
+        work_unit_deadline = (
+            time.monotonic() + settings.DERIVER.WORK_UNIT_TIMEOUT_SECONDS
+        )
         async with self.semaphore:
             queue_item_count = 0
             try:
@@ -627,8 +644,15 @@ class QueueManager:
                         break
                     try:
                         if work_unit.task_type == "representation":
-                            batch_result = await self.get_queue_item_batch(
-                                work_unit.task_type, work_unit_key, ownership.aqs_id
+                            batch_result = await asyncio.wait_for(
+                                self.get_queue_item_batch(
+                                    work_unit.task_type,
+                                    work_unit_key,
+                                    ownership.aqs_id,
+                                ),
+                                timeout=self._remaining_work_unit_timeout(
+                                    work_unit_deadline
+                                ),
                             )
                             messages_context = batch_result.messages_context
                             items_to_process = batch_result.items_to_process
@@ -659,31 +683,47 @@ class QueueManager:
                                     for item in items_to_process
                                     if item.message_id is not None
                                 ]
-                                await process_representation_batch(
-                                    messages_context,
-                                    message_level_configuration,
-                                    observers=observers,
-                                    observed=work_unit.observed,
-                                    queue_item_message_ids=queue_item_message_ids,
-                                    hit_batch_token_cap=batch_result.hit_batch_token_cap,
-                                    was_flush_enabled=batch_result.was_flush_enabled,
-                                    batch_max_tokens=batch_result.batch_max_tokens,
+                                await asyncio.wait_for(
+                                    process_representation_batch(
+                                        messages_context,
+                                        message_level_configuration,
+                                        observers=observers,
+                                        observed=work_unit.observed,
+                                        queue_item_message_ids=queue_item_message_ids,
+                                        hit_batch_token_cap=batch_result.hit_batch_token_cap,
+                                        was_flush_enabled=batch_result.was_flush_enabled,
+                                        batch_max_tokens=batch_result.batch_max_tokens,
+                                    ),
+                                    timeout=self._remaining_work_unit_timeout(
+                                        work_unit_deadline
+                                    ),
                                 )
                                 await self.mark_queue_items_as_processed(
                                     items_to_process, work_unit_key
                                 )
                                 queue_item_count += len(items_to_process)
                             except Exception as e:
-                                await self._handle_processing_error(
-                                    e,
-                                    items_to_process,
-                                    work_unit_key,
-                                    f"processing {work_unit.task_type} batch",
+                                should_release_work_unit = (
+                                    await self._handle_processing_error(
+                                        e,
+                                        items_to_process,
+                                        work_unit_key,
+                                        f"processing {work_unit.task_type} batch",
+                                    )
                                 )
+                                if should_release_work_unit:
+                                    break
 
                         else:
-                            queue_item = await self.get_next_queue_item(
-                                work_unit.task_type, work_unit_key, ownership.aqs_id
+                            queue_item = await asyncio.wait_for(
+                                self.get_next_queue_item(
+                                    work_unit.task_type,
+                                    work_unit_key,
+                                    ownership.aqs_id,
+                                ),
+                                timeout=self._remaining_work_unit_timeout(
+                                    work_unit_deadline
+                                ),
                             )
                             if not queue_item:
                                 logger.debug(
@@ -692,19 +732,33 @@ class QueueManager:
                                 break
 
                             try:
-                                await process_item(queue_item)
+                                await asyncio.wait_for(
+                                    process_item(queue_item),
+                                    timeout=self._remaining_work_unit_timeout(
+                                        work_unit_deadline
+                                    ),
+                                )
                                 await self.mark_queue_items_as_processed(
                                     [queue_item], work_unit_key
                                 )
                                 queue_item_count += 1
                             except Exception as e:
-                                await self._handle_processing_error(
-                                    e,
-                                    [queue_item],
-                                    work_unit_key,
-                                    "processing queue item",
+                                should_release_work_unit = (
+                                    await self._handle_processing_error(
+                                        e,
+                                        [queue_item],
+                                        work_unit_key,
+                                        "processing queue item",
+                                    )
                                 )
+                                if should_release_work_unit:
+                                    break
 
+                    except TimeoutError as e:
+                        await self._handle_processing_error(
+                            e, [], work_unit_key, "fetching queue item"
+                        )
+                        break
                     except Exception as e:
                         logger.error(
                             f"Error in processing loop for work unit {work_unit_key}: {e}",

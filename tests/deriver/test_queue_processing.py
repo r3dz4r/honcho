@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from nanoid import generate as generate_nanoid
@@ -294,6 +294,155 @@ class TestQueueProcessing:
             )
         ).scalar_one_or_none()
         assert remaining is None
+
+    async def test_timeout_records_explicit_error_and_releases_lease(
+        self,
+        db_session: AsyncSession,
+        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
+        create_queue_payload: Callable[..., Any],
+    ) -> None:
+        work_unit_key, queue_items = await self._add_representation_work_unit(
+            db_session=db_session,
+            sample_session_with_peers=sample_session_with_peers,
+            create_queue_payload=create_queue_payload,
+            token_counts=[settings.DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS],
+        )
+        qm = QueueManager()
+        worker_id = "timeout-worker"
+        aqs_id = (await qm.claim_work_units(db_session, [work_unit_key]))[work_unit_key]
+        qm.track_worker_work_unit(worker_id, work_unit_key, aqs_id)
+        await db_session.commit()
+        queue_item_id = queue_items[0].id
+
+        with patch(
+            "src.deriver.queue_manager.process_representation_batch",
+            side_effect=TimeoutError("provider deadline exceeded"),
+        ):
+            await qm.process_work_unit(work_unit_key, worker_id)
+
+        db_session.expire_all()
+        item = await db_session.get(models.QueueItem, queue_item_id)
+        assert item is not None
+        assert item.processed is True
+        assert item.error is not None and "TimeoutError" in item.error
+        assert worker_id not in qm.worker_ownership
+        active_session = (
+            await db_session.execute(
+                select(models.ActiveQueueSession).where(
+                    models.ActiveQueueSession.id == aqs_id
+                )
+            )
+        ).scalar_one_or_none()
+        assert active_session is None
+
+    async def test_fetch_timeout_releases_active_work_unit_lease(
+        self,
+        db_session: AsyncSession,
+        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
+        create_queue_payload: Callable[..., Any],
+    ) -> None:
+        work_unit_key, _queue_items = await self._add_representation_work_unit(
+            db_session=db_session,
+            sample_session_with_peers=sample_session_with_peers,
+            create_queue_payload=create_queue_payload,
+            token_counts=[settings.DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS],
+        )
+        qm = QueueManager()
+        worker_id = "fetch-timeout-worker"
+        aqs_id = (await qm.claim_work_units(db_session, [work_unit_key]))[work_unit_key]
+        qm.track_worker_work_unit(worker_id, work_unit_key, aqs_id)
+        await db_session.commit()
+
+        with patch.object(
+            qm, "get_queue_item_batch", new=AsyncMock(side_effect=TimeoutError("db"))
+        ):
+            await qm.process_work_unit(work_unit_key, worker_id)
+
+        assert worker_id not in qm.worker_ownership
+        active_session = await db_session.get(models.ActiveQueueSession, aqs_id)
+        assert active_session is None
+
+    async def test_timed_out_oldest_item_does_not_starve_later_work_unit(
+        self,
+        db_session: AsyncSession,
+        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
+        create_queue_payload: Callable[..., Any],
+    ) -> None:
+        work_unit_key, queue_items = await self._add_representation_work_unit(
+            db_session=db_session,
+            sample_session_with_peers=sample_session_with_peers,
+            create_queue_payload=create_queue_payload,
+            token_counts=[settings.DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS],
+        )
+        session, _peers = sample_session_with_peers
+        later_work_unit_key = f"summary:{session.workspace_name}:{session.name}:None:None"
+        db_session.add(
+            models.QueueItem(
+                session_id=session.id,
+                task_type="summary",
+                work_unit_key=later_work_unit_key,
+                payload={"task_type": "summary"},
+                processed=False,
+                workspace_name=session.workspace_name,
+            )
+        )
+        await db_session.commit()
+
+        qm = QueueManager()
+        timed_out_item_id = queue_items[0].id
+        await qm._handle_processing_error(  # pyright: ignore[reportPrivateUsage]
+            TimeoutError("provider deadline exceeded"),
+            queue_items,
+            work_unit_key,
+            "processing representation batch",
+        )
+
+        db_session.expire_all()
+        timed_out_item = await db_session.get(models.QueueItem, timed_out_item_id)
+        assert timed_out_item is not None and timed_out_item.processed is True
+        claimed = await qm.get_and_claim_work_units()
+        assert later_work_unit_key in claimed
+
+    async def test_successful_representation_batch_marks_item_processed(
+        self,
+        db_session: AsyncSession,
+        sample_session_with_peers: tuple[models.Session, list[models.Peer]],
+        create_queue_payload: Callable[..., Any],
+    ) -> None:
+        work_unit_key, queue_items = await self._add_representation_work_unit(
+            db_session=db_session,
+            sample_session_with_peers=sample_session_with_peers,
+            create_queue_payload=create_queue_payload,
+            token_counts=[settings.DERIVER.REPRESENTATION_BATCH_TARGET_INPUT_TOKENS],
+        )
+        qm = QueueManager()
+        worker_id = "success-worker"
+        aqs_id = (await qm.claim_work_units(db_session, [work_unit_key]))[work_unit_key]
+        qm.track_worker_work_unit(worker_id, work_unit_key, aqs_id)
+        await db_session.commit()
+        queue_item_id = queue_items[0].id
+
+        async def complete_normally(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        with patch(
+            "src.deriver.queue_manager.process_representation_batch",
+            side_effect=complete_normally,
+        ):
+            await qm.process_work_unit(work_unit_key, worker_id)
+
+        db_session.expire_all()
+        item = await db_session.get(models.QueueItem, queue_item_id)
+        assert item is not None
+        assert item.processed is True
+        active_session = (
+            await db_session.execute(
+                select(models.ActiveQueueSession).where(
+                    models.ActiveQueueSession.id == aqs_id
+                )
+            )
+        ).scalar_one_or_none()
+        assert active_session is None
 
     async def test_stale_work_unit_cleanup(
         self,

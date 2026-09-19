@@ -46,8 +46,6 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 M = TypeVar("M", bound=BaseModel)
-
-
 @overload
 async def honcho_llm_call(
     *,
@@ -215,6 +213,26 @@ async def honcho_llm_call(
 
         if stream:
             return await honcho_llm_call_inner(
+                    plan.provider,
+                    plan.model,
+                    prompt,
+                    max_tokens,
+                    response_model,
+                    json_mode,
+                    effective_temperature(temperature),
+                    stop_seqs,
+                    plan.reasoning_effort,
+                    verbosity,
+                    plan.thinking_budget_tokens,
+                    stream=True,
+                    client_override=plan.client,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    selected_config=plan.selected_config,
+                    plan=plan,
+                    telemetry=telemetry,
+            )
+        return await honcho_llm_call_inner(
                 plan.provider,
                 plan.model,
                 prompt,
@@ -226,33 +244,13 @@ async def honcho_llm_call(
                 plan.reasoning_effort,
                 verbosity,
                 plan.thinking_budget_tokens,
-                stream=True,
+                stream=False,
                 client_override=plan.client,
                 tools=tools,
                 tool_choice=tool_choice,
                 selected_config=plan.selected_config,
                 plan=plan,
                 telemetry=telemetry,
-            )
-        return await honcho_llm_call_inner(
-            plan.provider,
-            plan.model,
-            prompt,
-            max_tokens,
-            response_model,
-            json_mode,
-            effective_temperature(temperature),
-            stop_seqs,
-            plan.reasoning_effort,
-            verbosity,
-            plan.thinking_budget_tokens,
-            stream=False,
-            client_override=plan.client,
-            tools=tools,
-            tool_choice=tool_choice,
-            selected_config=plan.selected_config,
-            plan=plan,
-            telemetry=telemetry,
         )
 
     decorated = _call_with_provider_selection
@@ -346,6 +344,27 @@ async def honcho_llm_call(
                 # which overload a runtime `bool` matches.
                 if stream:
                     return await honcho_llm_call_inner(
+                            plan.provider,
+                            plan.model,
+                            prompt,
+                            max_tokens,
+                            response_model=response_model,
+                            json_mode=json_mode,
+                            temperature=effective_temperature(temperature),
+                            stop_seqs=stop_seqs,
+                            reasoning_effort=plan.reasoning_effort,
+                            verbosity=verbosity,
+                            thinking_budget_tokens=plan.thinking_budget_tokens,
+                            stream=True,
+                            client_override=plan.client,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            selected_config=plan.selected_config,
+                            plan=plan,
+                            telemetry=telemetry,
+                            messages=captured_messages,
+                    )
+                return await honcho_llm_call_inner(
                         plan.provider,
                         plan.model,
                         prompt,
@@ -357,7 +376,7 @@ async def honcho_llm_call(
                         reasoning_effort=plan.reasoning_effort,
                         verbosity=verbosity,
                         thinking_budget_tokens=plan.thinking_budget_tokens,
-                        stream=True,
+                        stream=False,
                         client_override=plan.client,
                         tools=tools,
                         tool_choice=tool_choice,
@@ -365,27 +384,6 @@ async def honcho_llm_call(
                         plan=plan,
                         telemetry=telemetry,
                         messages=captured_messages,
-                    )
-                return await honcho_llm_call_inner(
-                    plan.provider,
-                    plan.model,
-                    prompt,
-                    max_tokens,
-                    response_model=response_model,
-                    json_mode=json_mode,
-                    temperature=effective_temperature(temperature),
-                    stop_seqs=stop_seqs,
-                    reasoning_effort=plan.reasoning_effort,
-                    verbosity=verbosity,
-                    thinking_budget_tokens=plan.thinking_budget_tokens,
-                    stream=False,
-                    client_override=plan.client,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    selected_config=plan.selected_config,
-                    plan=plan,
-                    telemetry=telemetry,
-                    messages=captured_messages,
                 )
 
             wrapped = _toolless_call
