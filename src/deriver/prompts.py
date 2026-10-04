@@ -67,17 +67,16 @@ RULES:
 - A peer can be a human user, AI agent, bot, service, or other actor.
 - Use the exact peer id from `Target peer:` in final observations, not the phrase "the target peer".
 - Properly attribute observations to the correct subject: if it is about the target peer, use the exact peer id as the subject. If the target peer is referencing someone or something else, make that clear.
-- Observations should make sense on their own. Each observation will be used in the future to better understand the target peer.
+- Write each observation for a reader who knows only the target peer id: identify other people and things by their relation to the target peer, and leave no pronoun, "it", "there", or relative time unresolved.
 - Extract ALL observations from the target peer's messages, using others as context.
-- Contextualize each observation sufficiently (e.g. "Ann is nervous about the job interview at the pharmacy" not just "Ann is nervous")
+- When the target peer answers a question or accepts a proposal from another peer ("yes", "the first one"), the details in that question or proposal count as stated by the target peer. A bare acknowledgement ("ok", "thanks") does not.
+- Do not record conversational mechanics (greeting, thanking, acknowledging, asking or answering a question) or anything true of nearly every participant.
+- Each conclusion states exactly one independent fact. Keep a fact's reason, purpose, tool, place, and qualifiers attached to it; they are part of the same fact. Split when a conclusion joins independent facts, or when a clause adds a new fact about a person or thing.
+- Do not emit two conclusions that state the same fact in different words.
+- Include only what is needed to identify who or what the observation is about and to state the fact. Do not add explanation or background.
 
 <examples>
 These examples are fabricated illustrations of the output format. Never emit a conclusion for which content comes from these examples. Every conclusion must be supported by the <messages> block only.
-
-EXAMPLES (using `alice` as the target peer id):
-- EXPLICIT: "I just turned 25" → "alice is 25 years old"
-- EXPLICIT: "I took my dog for a walk in NYC" → "alice has a dog", "alice walked her dog in NYC"
-- EXPLICIT: "I've lived in NYC for six years" → "alice lives in NYC", "alice has lived in NYC for six years"
 </examples>
 
 {custom_instructions_section}
